@@ -57,11 +57,18 @@ if selected_model_label == "Custom (HuggingFace ID)":
 else:
     selected_model_name = AVAILABLE_MODELS[selected_model_label]
 
-gemini_key = st.sidebar.text_input(
-    "Gemini API Key",
-    type="password",
-    help="Get your key from aistudio.google.com"
+use_gemini = st.sidebar.checkbox(
+    "Use Gemini AI for explanation",
+    value=False,
+    help="Enable to use Gemini 3.5 Flash instead of built-in explanation. Requires API key and is subject to rate limits."
 )
+gemini_key = ""
+if use_gemini:
+    gemini_key = st.sidebar.text_input(
+        "Gemini API Key",
+        type="password",
+        help="Get your key from aistudio.google.com"
+    )
 frame_interval = st.sidebar.slider(
     "Frame sampling interval", 5, 30, 10,
     help="Analyze every Nth frame from video"
@@ -188,55 +195,152 @@ def compute_ecs(heatmaps):
         scores.append((cos + struct) / 2.0)
     return float(np.mean(scores))
 
-def get_gemini_explanation(label, confidence, heatmap_pil, api_key):
+def describe_gradcam_regions(gradcam_array):
+    """Extract factual spatial statistics from the raw GradCAM heatmap array.
+    Returns a text description of which facial quadrants have the highest
+    activation — grounded entirely in the actual numpy data."""
+    h, w = gradcam_array.shape
+    mid_h, mid_w = h // 2, w // 2
+
+    quadrants = {
+        "top-left (forehead / left eye region)": gradcam_array[:mid_h, :mid_w],
+        "top-right (forehead / right eye region)": gradcam_array[:mid_h, mid_w:],
+        "bottom-left (left cheek / mouth region)": gradcam_array[mid_h:, :mid_w],
+        "bottom-right (right cheek / chin region)": gradcam_array[mid_h:, mid_w:],
+    }
+
+    stats = []
+    for name, region in quadrants.items():
+        mean_val = float(region.mean())
+        max_val = float(region.max())
+        stats.append((name, mean_val, max_val))
+
+    # Sort by mean activation descending
+    stats.sort(key=lambda x: x[1], reverse=True)
+
+    overall_mean = float(gradcam_array.mean())
+    overall_max = float(gradcam_array.max())
+
+    lines = [f"Overall heatmap — mean activation: {overall_mean:.3f}, peak activation: {overall_max:.3f}"]
+    for name, mean_val, max_val in stats:
+        lines.append(f"  • {name}: mean={mean_val:.3f}, max={max_val:.3f}")
+
+    return "\n".join(lines)
+
+
+def generate_local_explanation(label, gradcam_array, ecs_score=None):
+    """Generate a grounded explanation from GradCAM stats and ECS score.
+    No API call — instant, free, and cannot hallucinate."""
+    h, w = gradcam_array.shape
+    mid_h, mid_w = h // 2, w // 2
+
+    quadrants = {
+        "forehead/eye region": gradcam_array[:mid_h, :],
+        "mouth/chin region": gradcam_array[mid_h:, :],
+        "left side of face": gradcam_array[:, :mid_w],
+        "right side of face": gradcam_array[:, mid_w:],
+    }
+
+    # Find the region with highest mean activation
+    region_stats = [(name, float(region.mean())) for name, region in quadrants.items()]
+    region_stats.sort(key=lambda x: x[1], reverse=True)
+    top_region = region_stats[0][0]
+    top_val = region_stats[0][1]
+    second_region = region_stats[1][0]
+
+    overall_mean = float(gradcam_array.mean())
+    overall_max = float(gradcam_array.max())
+
+    # Build explanation sentences
+    parts = []
+
+    # Sentence 1: Where the model focused
+    if top_val > 0.5:
+        parts.append(
+            f"The model's attention was strongly concentrated on the **{top_region}** "
+            f"(mean activation: {top_val:.3f}, peak: {overall_max:.3f}), "
+            f"with secondary focus on the **{second_region}**."
+        )
+    elif top_val > 0.2:
+        parts.append(
+            f"The model showed moderate attention on the **{top_region}** "
+            f"(mean activation: {top_val:.3f}), "
+            f"with some focus also on the **{second_region}**."
+        )
+    else:
+        parts.append(
+            f"The model's attention was diffuse across the face "
+            f"(overall mean: {overall_mean:.3f}), without strong focus on any single region."
+        )
+
+    # Sentence 2: What this means for the prediction
+    if label == "FAKE":
+        if top_val > 0.5:
+            parts.append(
+                f"The high activation in the {top_region} suggests the model detected "
+                f"potential manipulation artifacts in that area."
+            )
+        else:
+            parts.append(
+                f"The model flagged this as fake but without strongly localized attention, "
+                f"suggesting subtle or distributed manipulation."
+            )
+    else:
+        if top_val > 0.3:
+            parts.append(
+                f"The model examined the {top_region} closely and found no signs of manipulation, "
+                f"supporting the REAL classification."
+            )
+        else:
+            parts.append(
+                f"The model found no concentrated anomalies in any facial region, "
+                f"consistent with an authentic image."
+            )
+
+    # Sentence 3: ECS context (video only)
+    if ecs_score is not None:
+        if ecs_score > 0.7:
+            parts.append(
+                f"The ECS score of {ecs_score:.4f} indicates highly consistent attention "
+                f"across frames, suggesting a reliable detection."
+            )
+        elif ecs_score > 0.4:
+            parts.append(
+                f"The ECS score of {ecs_score:.4f} shows moderately consistent attention "
+                f"across frames."
+            )
+        else:
+            parts.append(
+                f"The ECS score of {ecs_score:.4f} indicates inconsistent attention "
+                f"across frames — the detection may be less reliable."
+            )
+
+    return " ".join(parts)
+
+
+def get_gemini_explanation(label, gradcam_array, heatmap_pil, api_key, ecs_score=None):
+    """Generate a brief AI explanation using Gemini 3.5 Flash, grounded on
+    the GradCAM heatmap data and ECS score from this project."""
     try:
         genai.configure(api_key=api_key)
-        
-        # Detect available models dynamically to avoid 404 model not found errors
-        model_name = "gemini-1.5-flash"
-        try:
-            available_models = [m.name for m in genai.list_models() if "generateContent" in m.supported_generation_methods]
-            available_models = [m.replace("models/", "") for m in available_models]
-            if "gemini-1.5-flash" in available_models:
-                model_name = "gemini-1.5-flash"
-            elif "gemini-1.5-flash-latest" in available_models:
-                model_name = "gemini-1.5-flash-latest"
-            elif any("gemini" in m for m in available_models):
-                model_name = next(m for m in available_models if "gemini" in m)
-        except Exception:
-            model_name = "gemini-1.5-flash"
-            
-        model = genai.GenerativeModel(model_name)
-        if label == "REAL":
-            prompt = f"""
-            This is a deepfake detection result.
-            Prediction: {label} (meaning the face is REAL and unmanipulated)
-            Confidence: {confidence:.2%}
+        model = genai.GenerativeModel("gemini-3.5-flash")
 
-            The attached image is a Grad-CAM heatmap showing where the model focused (even for real images, models focus on key facial features like eyes or mouth to verify authenticity).
+        region_desc = describe_gradcam_regions(gradcam_array)
 
-            Explain in simple language:
-            1. Which facial regions drew attention and why
-            2. Why the model concluded this is a REAL image (e.g. natural skin texture, consistent lighting, lack of blending artifacts)
-            3. Why the model is {'confident' if confidence > 0.75 else 'uncertain'} in this prediction
+        ecs_line = ""
+        if ecs_score is not None:
+            ecs_line = f"ECS (attention consistency across frames, 0-1): {ecs_score:.4f}"
 
-            Keep it concise, 3-4 sentences max. Do NOT mention any fake artifacts as being detected.
-            """
-        else:
-            prompt = f"""
-            This is a deepfake detection result.
-            Prediction: {label} (meaning the face is FAKE/manipulated)
-            Confidence: {confidence:.2%}
+        prompt = (
+            f"Deepfake detection result: {label}.\n"
+            f"Grad-CAM attention stats:\n{region_desc}\n"
+            f"{ecs_line}\n"
+            f"Using ONLY the stats above and the attached heatmap, "
+            f"explain in 2-3 simple sentences which face regions the model focused on "
+            f"and what that means for the {label} prediction. "
+            f"Do not invent any data not provided above."
+        )
 
-            The attached image is a Grad-CAM heatmap showing where the model focused to detect the fake (red/yellow areas = high attention).
-
-            Explain in simple language:
-            1. Which facial regions drew attention and why
-            2. What deepfake artifacts (if any) were likely detected (e.g., unnatural boundaries around eyes/mouth, blending issues, double textures)
-            3. Why the model is {'confident' if confidence > 0.75 else 'uncertain'} in this prediction
-
-            Keep it concise, 3-4 sentences max.
-            """
         response = model.generate_content([prompt, heatmap_pil])
         return response.text
     except Exception as e:
@@ -436,46 +540,65 @@ if uploaded is not None:
                                  f"Fake: {r['fake_conf']:.3f} | "
                                  f"Real: {r['real_conf']:.3f}")
 
-                # Gemini explanation for most representative frame
-                if gemini_key:
-                    st.subheader("🤖 Gemini AI Explanation")
-                    if result["verdict"] == "FAKE":
-                        most_suspicious = max(
-                            result["frames"],
-                            key=lambda x: x["fake_conf"]
-                        )
-                    else:
-                        most_suspicious = max(
-                            result["frames"],
-                            key=lambda x: x["real_conf"]
-                        )
-                    
-                    if most_suspicious["heatmap"] is None:
-                        try:
-                            _, _, _, pv = predict_face(
-                                most_suspicious["face"], processor, base_model,
-                                device, FAKE_IDX, REAL_IDX
-                            )
-                            _, heatmap_img = generate_gradcam(
-                                pv, most_suspicious["face"], wrapped, target_layers
-                            )
-                            most_suspicious["heatmap"] = heatmap_img
-                        except:
-                            pass
+                # Explanation for most representative frame
+                st.subheader("🤖 AI Explanation")
+                if result["verdict"] == "FAKE":
+                    most_suspicious = max(
+                        result["frames"],
+                        key=lambda x: x["fake_conf"]
+                    )
+                else:
+                    most_suspicious = max(
+                        result["frames"],
+                        key=lambda x: x["real_conf"]
+                    )
 
-                    if most_suspicious["heatmap"] is not None:
+                # Get GradCAM raw array for the representative frame
+                frame_gradcam_array = None
+                if most_suspicious["heatmap"] is None:
+                    try:
+                        _, _, _, pv = predict_face(
+                            most_suspicious["face"], processor, base_model,
+                            device, FAKE_IDX, REAL_IDX
+                        )
+                        cam_arr, heatmap_img = generate_gradcam(
+                            pv, most_suspicious["face"], wrapped, target_layers
+                        )
+                        most_suspicious["heatmap"] = heatmap_img
+                        frame_gradcam_array = cam_arr
+                    except:
+                        pass
+                else:
+                    try:
+                        _, _, _, pv = predict_face(
+                            most_suspicious["face"], processor, base_model,
+                            device, FAKE_IDX, REAL_IDX
+                        )
+                        frame_gradcam_array, _ = generate_gradcam(
+                            pv, most_suspicious["face"], wrapped, target_layers
+                        )
+                    except:
+                        pass
+
+                if frame_gradcam_array is not None:
+                    # Use Gemini if toggled on + key provided, else local
+                    if use_gemini and gemini_key:
                         hm_pil = Image.fromarray(most_suspicious["heatmap"])
                         with st.spinner("Generating Gemini explanation..."):
                             explanation = get_gemini_explanation(
                                 most_suspicious["label"],
-                                most_suspicious["fake_conf"] if most_suspicious["label"] == "FAKE" else most_suspicious["real_conf"],
+                                frame_gradcam_array,
                                 hm_pil,
-                                gemini_key
+                                gemini_key,
+                                ecs_score=result["ecs"]
                             )
-                        st.write(explanation)
-                elif not gemini_key:
-                    st.info("💡 Enter your Gemini API key in the sidebar "
-                            "to get AI explanations")
+                    else:
+                        explanation = generate_local_explanation(
+                            most_suspicious["label"],
+                            frame_gradcam_array,
+                            ecs_score=result["ecs"]
+                        )
+                    st.write(explanation)
 
     # ── IMAGE ──
     else:
@@ -512,18 +635,17 @@ if uploaded is not None:
                     c2.image(heatmap_img, caption="Grad-CAM Heatmap",
                              use_container_width=True)
 
-                    # Gemini
-                    if gemini_key:
-                        st.subheader("🤖 Gemini AI Explanation")
+                    # Explanation
+                    st.subheader("🤖 AI Explanation")
+                    if use_gemini and gemini_key:
                         hm_pil = Image.fromarray(heatmap_img)
-                        with st.spinner("Generating explanation..."):
+                        with st.spinner("Generating Gemini explanation..."):
                              explanation = get_gemini_explanation(
-                                 label, fake_conf if label == "FAKE" else real_conf, hm_pil, gemini_key
+                                 label, cam_map, hm_pil, gemini_key
                              )
-                        st.write(explanation)
                     else:
-                        st.info("💡 Enter Gemini API key in sidebar "
-                                "for AI explanation")
+                        explanation = generate_local_explanation(label, cam_map)
+                    st.write(explanation)
                 except Exception as e:
                     st.warning(f"Grad-CAM skipped: {e}")
 
