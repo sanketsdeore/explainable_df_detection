@@ -3,6 +3,14 @@
 # Run with:  streamlit run app.py
 # ============================================================
 
+import sys
+import os
+# Fix Windows Streamlit path resolution issues (remove file path entries from sys.path)
+dir_path = os.path.dirname(os.path.realpath(__file__))
+if dir_path not in sys.path:
+    sys.path.insert(0, dir_path)
+sys.path = [p for p in sys.path if not p.endswith(".py")]
+
 import streamlit as st
 import torch
 import cv2
@@ -11,7 +19,7 @@ import tempfile
 import os
 import math
 from PIL import Image
-from transformers import ViTImageProcessor, ViTForImageClassification
+from transformers import AutoImageProcessor, AutoModelForImageClassification
 from facenet_pytorch import MTCNN
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
@@ -30,6 +38,25 @@ st.markdown("Upload a **video or image** to detect deepfakes with visual explana
 
 # ── Sidebar — API Key input (never hardcode this!) ────────
 st.sidebar.header("⚙️ Settings")
+
+AVAILABLE_MODELS = {
+    "Dima806 ViT (Vision Transformer)": "dima806/deepfake_vs_real_image_detection",
+    "PrithivMLmods SigLIP (CNN/ViT Hybrid)": "prithivMLmods/Deep-Fake-Detector-Model",
+    "SuriyaaMM EfficientNet (CNN)": "SuriyaaMM/google-efficientnet-b1-deepfake",
+    "Purnachander Swin (Shifted Window)": "Purnachander-Konda/deepfake-detection-swin"
+}
+
+selected_model_label = st.sidebar.selectbox(
+    "Select Pretrained Model", 
+    list(AVAILABLE_MODELS.keys()) + ["Custom (HuggingFace ID)"],
+    help="Choose a HuggingFace ViT model to use for deepfake detection. Different models have different ECS performance."
+)
+
+if selected_model_label == "Custom (HuggingFace ID)":
+    selected_model_name = st.sidebar.text_input("Enter HuggingFace Model ID", "dima806/deepfake_vs_real_image_detection")
+else:
+    selected_model_name = AVAILABLE_MODELS[selected_model_label]
+
 gemini_key = st.sidebar.text_input(
     "Gemini API Key",
     type="password",
@@ -44,48 +71,65 @@ fake_threshold = st.sidebar.slider(
     help="If more than X% of frames are fake, video is FAKE"
 )
 
+# ── Wrapped model for Grad-CAM ──
+class WrappedModel(torch.nn.Module):
+    def __init__(self, m):
+        super().__init__()
+        self.model = m
+    def forward(self, x):
+        return self.model(pixel_values=x).logits
+
 # ── Load models (cached so they don't reload every run) ──
 @st.cache_resource
-def load_models():
+def load_models(model_name="dima806/deepfake_vs_real_image_detection"):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    st.write(f"Using device: `{device}`")
+    print(f"Using device: {device}")
 
     # Face detector
     mtcnn = MTCNN(keep_all=False, device=device)
 
-    # Deepfake detector — dima806 ViT (~96% accuracy)
-    MODEL_NAME = "dima806/deepfake_vs_real_image_detection"
-    processor  = ViTImageProcessor.from_pretrained(MODEL_NAME)
-    vit_model  = ViTForImageClassification.from_pretrained(MODEL_NAME).to(device)
-    vit_model.eval()
+    # Deepfake detector
+    try:
+        processor  = AutoImageProcessor.from_pretrained(model_name)
+    except OSError:
+        # Fallback if the model repository lacks a preprocessor_config.json
+        processor = AutoImageProcessor.from_pretrained("google/vit-base-patch16-224")
+    
+    base_model  = AutoModelForImageClassification.from_pretrained(model_name).to(device)
+    base_model.eval()
 
     # Confirm label mapping
-    id2label = vit_model.config.id2label
-    FAKE_IDX = [k for k, v in id2label.items() if 'fake' in v.lower()][0]
-    REAL_IDX = [k for k, v in id2label.items() if 'real' in v.lower()][0]
+    id2label = base_model.config.id2label
+    try:
+        FAKE_IDX = [k for k, v in id2label.items() if 'fake' in v.lower()][0]
+        REAL_IDX = [k for k, v in id2label.items() if 'real' in v.lower()][0]
+    except IndexError:
+        print(f"Label mapping could not strictly find 'fake'/'real' in model config: {id2label}. Defaulting to 1 for FAKE, 0 for REAL.")
+        REAL_IDX = 0
+        FAKE_IDX = 1
 
-    # Wrap model for Grad-CAM
-    class WrappedViT(torch.nn.Module):
-        def __init__(self, m): super().__init__(); self.model = m
-        def forward(self, x): return self.model(pixel_values=x).logits
-
-    wrapped = WrappedViT(vit_model)
-    wrapped.eval()
-
-    if hasattr(vit_model.vit, "encoder"):
-        target_layers = [vit_model.vit.encoder.layer[-1].layernorm_before]
-    else:
-        target_layers = [vit_model.vit.layers[-1].layernorm_before]
-
-    return device, mtcnn, processor, vit_model, wrapped, target_layers, FAKE_IDX, REAL_IDX
+    return device, mtcnn, processor, base_model, FAKE_IDX, REAL_IDX
 
 # ── Helper functions ──────────────────────────────────────
 
 def reshape_transform(tensor):
-    result = tensor[:, 1:, :]
-    B, N, C = result.shape
-    H = W = int(N ** 0.5)
-    return result.reshape(B, H, W, C).permute(0, 3, 1, 2)
+    if tensor.ndim == 4:
+        return tensor  # CNNs (ResNet, EfficientNet) already output 4D
+    elif tensor.ndim == 3:
+        B, N, C = tensor.shape
+        # Check if it has a CLS token
+        if int(N ** 0.5) ** 2 == N:
+            # No CLS token (e.g. SigLIP)
+            result = tensor
+            H = W = int(N ** 0.5)
+        elif int((N - 1) ** 0.5) ** 2 == (N - 1):
+            # One CLS token (e.g. standard ViT)
+            result = tensor[:, 1:, :]
+            H = W = int((N - 1) ** 0.5)
+        else:
+            return tensor
+        return result.reshape(B, H, W, C).permute(0, 3, 1, 2)
+    return tensor
 
 def extract_face(frame_rgb, mtcnn):
     h, w, _ = frame_rgb.shape
@@ -103,11 +147,11 @@ def extract_face(frame_rgb, mtcnn):
         return None
     return cv2.resize(face, (224, 224), interpolation=cv2.INTER_CUBIC)
 
-def predict_face(face_np, processor, vit_model, device, FAKE_IDX, REAL_IDX):
+def predict_face(face_np, processor, base_model, device, FAKE_IDX, REAL_IDX):
     image  = Image.fromarray(face_np)
     inputs = processor(images=image, return_tensors="pt").to(device)
     with torch.no_grad():
-        probs = torch.softmax(vit_model(**inputs).logits, dim=1)[0]
+        probs = torch.softmax(base_model(**inputs).logits, dim=1)[0]
     fake_conf = probs[FAKE_IDX].item()
     real_conf = probs[REAL_IDX].item()
     label = "FAKE" if fake_conf > 0.5 else "REAL"
@@ -147,29 +191,59 @@ def compute_ecs(heatmaps):
 def get_gemini_explanation(label, confidence, heatmap_pil, api_key):
     try:
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        prompt = f"""
-        This is a deepfake detection result.
-        Prediction: {label}
-        Confidence: {confidence:.2%}
+        
+        # Detect available models dynamically to avoid 404 model not found errors
+        model_name = "gemini-1.5-flash"
+        try:
+            available_models = [m.name for m in genai.list_models() if "generateContent" in m.supported_generation_methods]
+            available_models = [m.replace("models/", "") for m in available_models]
+            if "gemini-1.5-flash" in available_models:
+                model_name = "gemini-1.5-flash"
+            elif "gemini-1.5-flash-latest" in available_models:
+                model_name = "gemini-1.5-flash-latest"
+            elif any("gemini" in m for m in available_models):
+                model_name = next(m for m in available_models if "gemini" in m)
+        except Exception:
+            model_name = "gemini-1.5-flash"
+            
+        model = genai.GenerativeModel(model_name)
+        if label == "REAL":
+            prompt = f"""
+            This is a deepfake detection result.
+            Prediction: {label} (meaning the face is REAL and unmanipulated)
+            Confidence: {confidence:.2%}
 
-        The attached image is a Grad-CAM heatmap showing where the model focused.
-        Red/yellow areas = high attention. Blue = low attention.
+            The attached image is a Grad-CAM heatmap showing where the model focused (even for real images, models focus on key facial features like eyes or mouth to verify authenticity).
 
-        Explain in simple language:
-        1. Which facial regions drew attention and why
-        2. What deepfake artifacts (if any) were likely detected
-        3. Why the model is {'confident' if confidence > 0.75 else 'uncertain'} in this prediction
+            Explain in simple language:
+            1. Which facial regions drew attention and why
+            2. Why the model concluded this is a REAL image (e.g. natural skin texture, consistent lighting, lack of blending artifacts)
+            3. Why the model is {'confident' if confidence > 0.75 else 'uncertain'} in this prediction
 
-        Keep it concise, 3-4 sentences max.
-        """
+            Keep it concise, 3-4 sentences max. Do NOT mention any fake artifacts as being detected.
+            """
+        else:
+            prompt = f"""
+            This is a deepfake detection result.
+            Prediction: {label} (meaning the face is FAKE/manipulated)
+            Confidence: {confidence:.2%}
+
+            The attached image is a Grad-CAM heatmap showing where the model focused to detect the fake (red/yellow areas = high attention).
+
+            Explain in simple language:
+            1. Which facial regions drew attention and why
+            2. What deepfake artifacts (if any) were likely detected (e.g., unnatural boundaries around eyes/mouth, blending issues, double textures)
+            3. Why the model is {'confident' if confidence > 0.75 else 'uncertain'} in this prediction
+
+            Keep it concise, 3-4 sentences max.
+            """
         response = model.generate_content([prompt, heatmap_pil])
         return response.text
     except Exception as e:
         return f"Gemini explanation unavailable: {str(e)}"
 
 def process_video(video_path, models, frame_interval, fake_threshold):
-    device, mtcnn, processor, vit_model, wrapped, target_layers, FAKE_IDX, REAL_IDX = models
+    device, mtcnn, processor, base_model, wrapped, target_layers, FAKE_IDX, REAL_IDX = models
 
     cap        = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -192,7 +266,7 @@ def process_video(video_path, models, frame_interval, fake_threshold):
 
             if face is not None:
                 label, fake_conf, real_conf, pv = predict_face(
-                    face, processor, vit_model, device, FAKE_IDX, REAL_IDX
+                    face, processor, base_model, device, FAKE_IDX, REAL_IDX
                 )
                 cam_map = None
                 heatmap_img = None
@@ -201,8 +275,9 @@ def process_video(video_path, models, frame_interval, fake_threshold):
                         cam_map, heatmap_img = generate_gradcam(pv, face, wrapped, target_layers)
                         heatmaps.append(cam_map)
                         heatmap_images.append(heatmap_img)
-                    except:
-                        pass
+                    except Exception as e:
+                        import traceback
+                        st.error(f"Grad-CAM Error: {traceback.format_exc()}")
 
                 frame_results.append({
                     "frame":      count,
@@ -247,11 +322,48 @@ def process_video(video_path, models, frame_interval, fake_threshold):
 
 # ── Main UI ───────────────────────────────────────────────
 
-# Load models once
-with st.spinner("Loading models (first run takes ~30 seconds)..."):
-    models = load_models()
+with st.spinner(f"Loading model '{selected_model_name}'..."):
+    models = load_models(selected_model_name)
 
-_, mtcnn, processor, vit_model, wrapped, target_layers, FAKE_IDX, REAL_IDX = models
+device, mtcnn, processor, base_model, FAKE_IDX, REAL_IDX = models
+
+# Create Grad-CAM wrapper and target layers on the fly
+wrapped = WrappedModel(base_model)
+wrapped.eval()
+
+# Dynamically find target layer based on model architecture
+if hasattr(base_model, "vit"):
+    if hasattr(base_model.vit, "encoder"):
+        target_layers = [base_model.vit.encoder.layer[-1].layernorm_before]
+    else:
+        target_layers = [base_model.vit.layers[-1].layernorm_before]
+elif hasattr(base_model, "resnet"):
+    target_layers = [base_model.resnet.encoder.stages[-1].layers[-1]]
+elif hasattr(base_model, "efficientnet"):
+    target_layers = [base_model.efficientnet.encoder.blocks[-1]]
+elif hasattr(base_model, "swin"):
+    target_layers = [base_model.swin.layernorm]
+elif hasattr(base_model, "vision_model"):
+    # Often SigLIP or CLIP-like vision encoders
+    try:
+        target_layers = [base_model.vision_model.encoder.layers[-1].layer_norm1]
+    except:
+        target_layers = [list(base_model.vision_model.children())[-1]]
+elif hasattr(base_model, "xception"):
+    try:
+        target_layers = [base_model.xception.encoder.blocks[-1]]
+    except:
+        target_layers = [list(base_model.children())[-1]]
+else:
+    # Fallback to the last immediate child (often works for custom timm architectures)
+    try:
+        target_layers = [list(list(base_model.children())[0].children())[-1]]
+    except:
+        target_layers = [list(base_model.children())[-1]]
+
+all_models = (device, mtcnn, processor, base_model, wrapped, target_layers, FAKE_IDX, REAL_IDX)
+
+st.write(f"Using device: `{device}`")
 
 # File uploader
 uploaded = st.file_uploader(
@@ -274,7 +386,7 @@ if uploaded is not None:
         if st.button("🔍 Analyze Video"):
             with st.spinner("Analyzing video..."):
                 result = process_video(
-                    tmp_path, models, frame_interval, fake_threshold
+                    tmp_path, all_models, frame_interval, fake_threshold
                 )
 
             if result is None:
@@ -324,19 +436,39 @@ if uploaded is not None:
                                  f"Fake: {r['fake_conf']:.3f} | "
                                  f"Real: {r['real_conf']:.3f}")
 
-                # Gemini explanation for most suspicious frame
-                if gemini_key and result["heatmaps"]:
+                # Gemini explanation for most representative frame
+                if gemini_key:
                     st.subheader("🤖 Gemini AI Explanation")
-                    most_suspicious = max(
-                        result["frames"],
-                        key=lambda x: x["fake_conf"]
-                    )
+                    if result["verdict"] == "FAKE":
+                        most_suspicious = max(
+                            result["frames"],
+                            key=lambda x: x["fake_conf"]
+                        )
+                    else:
+                        most_suspicious = max(
+                            result["frames"],
+                            key=lambda x: x["real_conf"]
+                        )
+                    
+                    if most_suspicious["heatmap"] is None:
+                        try:
+                            _, _, _, pv = predict_face(
+                                most_suspicious["face"], processor, base_model,
+                                device, FAKE_IDX, REAL_IDX
+                            )
+                            _, heatmap_img = generate_gradcam(
+                                pv, most_suspicious["face"], wrapped, target_layers
+                            )
+                            most_suspicious["heatmap"] = heatmap_img
+                        except:
+                            pass
+
                     if most_suspicious["heatmap"] is not None:
                         hm_pil = Image.fromarray(most_suspicious["heatmap"])
                         with st.spinner("Generating Gemini explanation..."):
                             explanation = get_gemini_explanation(
                                 most_suspicious["label"],
-                                most_suspicious["fake_conf"],
+                                most_suspicious["fake_conf"] if most_suspicious["label"] == "FAKE" else most_suspicious["real_conf"],
                                 hm_pil,
                                 gemini_key
                             )
@@ -357,8 +489,8 @@ if uploaded is not None:
                 st.error("No face detected in image.")
             else:
                 label, fake_conf, real_conf, pv = predict_face(
-                    face_np, processor, vit_model,
-                    models[0], FAKE_IDX, REAL_IDX
+                    face_np, processor, base_model,
+                    device, FAKE_IDX, REAL_IDX
                 )
 
                 # Result
@@ -385,9 +517,9 @@ if uploaded is not None:
                         st.subheader("🤖 Gemini AI Explanation")
                         hm_pil = Image.fromarray(heatmap_img)
                         with st.spinner("Generating explanation..."):
-                            explanation = get_gemini_explanation(
-                                label, fake_conf, hm_pil, gemini_key
-                            )
+                             explanation = get_gemini_explanation(
+                                 label, fake_conf if label == "FAKE" else real_conf, hm_pil, gemini_key
+                             )
                         st.write(explanation)
                     else:
                         st.info("💡 Enter Gemini API key in sidebar "
