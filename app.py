@@ -194,8 +194,8 @@ def compute_ecs(heatmaps):
         return 0.0
     scores = []
     for i in range(len(heatmaps) - 1):
-        h1 = normalize_heatmap(heatmaps[i])
-        h2 = normalize_heatmap(heatmaps[i+1])
+        h1 = cv2.resize(normalize_heatmap(heatmaps[i]), (224, 224), interpolation=cv2.INTER_LINEAR)
+        h2 = cv2.resize(normalize_heatmap(heatmaps[i+1]), (224, 224), interpolation=cv2.INTER_LINEAR)
         cos = np.dot(h1.flatten(), h2.flatten()) / (
             np.linalg.norm(h1) * np.linalg.norm(h2) + 1e-8
         )
