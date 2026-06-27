@@ -182,11 +182,14 @@ def reshape_transform(tensor):
         return result.reshape(B, H, W, C).permute(0, 3, 1, 2)
     return tensor
 
-def extract_face(frame_rgb, mtcnn):
+def extract_face(frame_rgb, mtcnn, prob_threshold=0.85):
     h, w, _ = frame_rgb.shape
-    boxes, _ = mtcnn.detect(frame_rgb)
-    if boxes is None:
+    boxes, probs = mtcnn.detect(frame_rgb)
+    if boxes is None or probs is None:
         return None
+    if probs[0] is None or probs[0] < prob_threshold:
+        return None
+
     x1, y1, x2, y2 = map(int, boxes[0])
     bw, bh = x2 - x1, y2 - y1
     x1 = max(0, int(x1 - bw * 0.3))
@@ -251,13 +254,18 @@ def predict_face_multi(face_np, model_list, device):
 
 
 def generate_gradcam(pixel_values, face_np, wrapped, target_layers):
-    rgb_float = face_np.astype(np.float32) / 255.0
     cam = GradCAM(
         model=wrapped,
         target_layers=target_layers,
         reshape_transform=reshape_transform
     )
     grayscale_cam = cam(input_tensor=pixel_values)[0]
+    
+    # Resize rgb_float to match grayscale_cam shape
+    h, w = grayscale_cam.shape
+    face_resized = cv2.resize(face_np, (w, h))
+    rgb_float = face_resized.astype(np.float32) / 255.0
+    
     heatmap_vis   = show_cam_on_image(rgb_float, grayscale_cam, use_rgb=True)
     return grayscale_cam, heatmap_vis
 
@@ -501,7 +509,7 @@ def process_video_multi(video_path, device, mtcnn, model_list,
 
                 cam_map = None
                 heatmap_img = None
-                if label in ("FAKE", "CONTESTED") and best_model is not None:
+                if best_model is not None:
                     try:
                         w = WrappedModel(best_model)
                         w.eval()
@@ -555,8 +563,14 @@ def process_video_multi(video_path, device, mtcnn, model_list,
     else:
         verdict = "REAL"
 
-    avg_conf = np.mean([r["fake_conf"] for r in frame_results
-                        if r["label"] == "FAKE"]) if n_fake > 0 else 0.0
+    if verdict == "FAKE":
+        avg_conf = np.mean([r["fake_conf"] for r in frame_results if r["label"] == "FAKE"]) if n_fake > 0 else 0.0
+    elif verdict == "REAL":
+        n_real = n_total - n_fake - n_contested
+        avg_conf = np.mean([r["real_conf"] for r in frame_results if r["label"] == "REAL"]) if n_real > 0 else 0.0
+    else:
+        # CONTESTED
+        avg_conf = np.mean([r["fake_conf"] for r in frame_results if r["label"] == "CONTESTED"]) if n_contested > 0 else 0.0
     ecs      = compute_ecs(heatmaps)
 
     return {
@@ -614,6 +628,8 @@ if uploaded is not None:
 
             if result is None:
                 st.error("No faces detected in video.")
+                os.unlink(tmp_path)
+                st.stop()
             else:
                 # Verdict banner
                 if result["verdict"] == "FAKE":
@@ -630,7 +646,8 @@ if uploaded is not None:
                             f"{result['n_fake']}/{result['n_total']}")
                 col2.metric("Fake Ratio",
                             f"{result['fake_ratio']:.1%}")
-                col3.metric("Avg Confidence",
+                conf_label = "Avg Conf (Fake)" if result['verdict'] == "FAKE" else "Avg Conf (Real)" if result['verdict'] == "REAL" else "Avg Conf (Contested)"
+                col3.metric(conf_label,
                             f"{result['avg_conf']:.1%}")
                 col4.metric("ECS Score",
                             f"{result['ecs']:.4f}",
@@ -814,6 +831,8 @@ if uploaded is not None:
 
             if face_np is None:
                 st.error("No face detected in image.")
+                os.unlink(tmp_path)
+                st.stop()
             else:
                 label, fake_conf, real_conf, per_model_results, vote_ratio = predict_face_multi(
                     face_np, model_list, device
